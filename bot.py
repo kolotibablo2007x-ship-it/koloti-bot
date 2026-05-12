@@ -1,207 +1,440 @@
-import telebot
-import sqlite3
-import hashlib
 import os
-from datetime import datetime, timedelta
-from telebot import types
-from flask import Flask, request
+os.environ.pop('HTTP_PROXY', None)
+os.environ.pop('HTTPS_PROXY', None)
+os.environ.pop('http_proxy', None)
+os.environ.pop('https_proxy', None)
 
-# ========== CONFIG - CHANGE THESE 3 LINES ==========
-BOT_TOKEN = "8665740327:AAFTlgtFCg8B5hNlE46NcP8kUlt5rZ3FOaI" # Get from @BotFather
-ADMIN_ID = 7440168853 # Get from @userinfobot
-MIN_WITHDRAW = 2.00
-MONETAG_LINK = "https://google.com/recaptcha/api2/demo" # Get from Monetag.com
-# ===================================================
+import json
+from telegram import Update, BotCommand, BotCommandScopeChat, BotCommandScopeDefault
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from datetime import datetime
 
-bot = telebot.TeleBot(BOT_TOKEN)
-app = Flask(__name__)
+# ========== A. CONFIG ==========
+TOKEN = "8666612292:AAHObKPjfMVEQPeqRqTTKBYx3xPEBLS8PHQ"
+ADMIN_ID = 7440168853
 
-# Database setup - Render uses /tmp for temp files
-DB_PATH = '/tmp/koloti.db'
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-cursor = conn.cursor()
-cursor.execute('''CREATE TABLE IF NOT EXISTS users
-               (user_id INTEGER PRIMARY KEY, username TEXT, balance REAL DEFAULT 0, pin TEXT, password TEXT,
-                ref_by INTEGER DEFAULT 0, ref_count INTEGER DEFAULT 0, last_daily TEXT, task_count INTEGER DEFAULT 0,
-                join_date TEXT, state TEXT)''')
-cursor.execute('''CREATE TABLE IF NOT EXISTS withdraws
-               (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL, method TEXT,
-                account TEXT, status TEXT DEFAULT 'pending', date TEXT)''')
-conn.commit()
+USERS_FILE = "users.json"
+BANNED_FILE = "banned.json"
+STATS_FILE = "stats.json"
+BLOCKED_FILE = "blocked.json"
+MESSAGES_FILE = "messages.json"
+BROADCAST_FILE = "broadcast.json"
 
-def main_menu():
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.row('💰 Balance', '📋 Tasks')
-    markup.row('🎁 Daily', '👥 Refer')
-    markup.row('💸 Withdraw', '💳 Deposit')
-    return markup
+# ========== B. DATABASE ==========
+def load_json(file):
+    if os.path.exists(file):
+        with open(file, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
 
-def get_user(user_id):
-    cursor.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-    return cursor.fetchone()
+def save_json(file, data):
+    with open(file, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-def update_balance(user_id, amount):
-    cursor.execute("UPDATE users SET balance = balance +? WHERE user_id=?", (amount, user_id))
-    conn.commit()
+all_users = set(load_json(USERS_FILE).get("users", []))
+banned_users = set(load_json(BANNED_FILE).get("banned", []))
+blocked_users = set(load_json(BLOCKED_FILE).get("blocked", []))
+stats = load_json(STATS_FILE)
+messages_map = load_json(MESSAGES_FILE)
+broadcast_map = load_json(BROADCAST_FILE) # admin_msg_id: {user_id: user_msg_id}
 
-@bot.message_handler(commands=['start'])
-def start(message):
-    user_id = message.chat.id
-    username = message.from_user.username or message.from_user.first_name
-    ref_by = 0
-    if len(message.text.split()) > 1:
-        try:
-            ref_by = int(message.text.split()[1])
-            if ref_by == user_id: ref_by = 0
-        except: pass
+print(f"[START] Users: {len(all_users)} | Banned: {len(banned_users)}")
 
-    user = get_user(user_id)
-    if not user:
-        cursor.execute("INSERT INTO users (user_id, username, balance, ref_by, join_date) VALUES (?,?,?,?,?)",
-                      (user_id, username, 0.10, ref_by, datetime.now().strftime('%Y-%m-%d %H:%M')))
-        conn.commit()
-        if ref_by!= 0:
-            update_balance(ref_by, 0.05)
-            cursor.execute("UPDATE users SET ref_count = ref_count + 1 WHERE user_id=?", (ref_by,))
-            conn.commit()
-            try: bot.send_message(ref_by, f"🎉 New Referral! +$0.05 bonus")
-            except: pass
-        bot.reply_to(message, f"Welcome {username}! 🎁\n\nJoining Bonus: $0.10\n\nUse the buttons below", reply_markup=main_menu())
-    else:
-        bot.reply_to(message, f"Welcome back {username}!", reply_markup=main_menu())
+# ========== C. COMMANDS ==========
+async def setup_commands(application: Application):
+    user_commands = [BotCommand("start", "Start bot")]
+    await application.bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
 
-@bot.message_handler(func=lambda m: m.text == '💰 Balance')
-def balance(message):
-    user = get_user(message.chat.id)
-    if user: bot.reply_to(message, f"💰 Balance: ${user[2]:.2f}\n📋 Tasks: {user[8]}\n👥 Referrals: {user[6]}\n\nMin Withdraw: ${MIN_WITHDRAW}")
-    else: bot.reply_to(message, "Send /start first")
+    admin_commands = [
+        BotCommand("start", "Start bot"),
+        BotCommand("panel", "Admin Panel"),
+        BotCommand("stats", "Full Statistics"),
+        BotCommand("users", "All Users List"),
+        BotCommand("banned", "Banned Users"),
+        BotCommand("blocked", "Blocked Bot Users"),
+        BotCommand("ban", "Ban user - /ban 12345"),
+        BotCommand("unban", "Unban user - /unban 12345"),
+        BotCommand("broadcast", "Send to all - /broadcast msg")
+    ]
+    await application.bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
 
-@bot.message_handler(func=lambda m: m.text == '🎁 Daily')
-def daily(message):
-    user_id = message.chat.id
-    user = get_user(user_id)
-    if not user: return
-    last_daily = user[7]
-    if last_daily:
-        last_time = datetime.strptime(last_daily, '%Y-%m-%d %H:%M')
-        if datetime.now() - last_time < timedelta(hours=24):
-            remain = timedelta(hours=24) - (datetime.now() - last_time)
-            bot.reply_to(message, f"⏰ Come back after {remain.seconds//3600}h {remain.seconds%3600//60}m")
-            return
-    update_balance(user_id, 0.05)
-    cursor.execute("UPDATE users SET last_daily=? WHERE user_id=?", (datetime.now().strftime('%Y-%m-%d %H:%M'), user_id))
-    conn.commit()
-    new_bal = get_user(user_id)[2]
-    bot.reply_to(message, f"🎁 Daily Bonus: +$0.05\n💰 New Balance: ${new_bal:.2f}")
+# ========== D. START ==========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
 
-@bot.message_handler(func=lambda m: m.text == '📋 Tasks')
-def tasks(message):
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("📺 Watch Video Ad - $0.02", callback_data="ad_0.02"))
-    markup.add(types.InlineKeyboardButton("🔗 Visit Link - $0.01", callback_data="ad_0.01"))
-    bot.reply_to(message, "📋 Tasks:\nComplete tasks to earn. Cheating = Ban", reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('ad_'))
-def ad_task(call):
-    reward = float(call.data.split('_')[1])
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("📺 Click to Watch Ad", url=MONETAG_LINK))
-    markup.add(types.InlineKeyboardButton("✅ Done Watching", callback_data=f"verify_{reward}"))
-    bot.edit_message_text("1. Click link and watch 30s Ad\n2. Come back and press Verify", call.message.chat.id, call.message.message_id, reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('verify_'))
-def verify_ad(call):
-    reward = float(call.data.split('_')[1])
-    update_balance(call.message.chat.id, reward)
-    cursor.execute("UPDATE users SET task_count = task_count + 1 WHERE user_id=?", (call.message.chat.id,))
-    conn.commit()
-    bot.answer_callback_query(call.id, f"+${reward} added!")
-    new_bal = get_user(call.message.chat.id)[2]
-    bot.edit_message_text(f"✅ Verified! +${reward}\n💰 Balance: ${new_bal:.2f}", call.message.chat.id, call.message.message_id)
-
-@bot.message_handler(func=lambda m: m.text == '👥 Refer')
-def refer(message):
-    user_id = message.chat.id
-    user = get_user(user_id)
-    link = f"https://t.me/{bot.get_me().username}?start={user_id}"
-    bot.reply_to(message, f"👥 Your Link:\n`{link}`\n\nPer Refer: $0.05\nTotal: {user[6]} users", parse_mode='Markdown')
-
-@bot.message_handler(func=lambda m: m.text == '💸 Withdraw')
-def withdraw(message):
-    user = get_user(message.chat.id)
-    if user[2] < MIN_WITHDRAW:
-        bot.reply_to(message, f"❌ Minimum ${MIN_WITHDRAW} required\nYour Balance: ${user[2]:.2f}")
+    if user.id == ADMIN_ID:
+        await panel_command(update, context)
         return
-    cursor.execute("UPDATE users SET state='w_amount' WHERE user_id=?", (message.chat.id,))
-    conn.commit()
-    bot.reply_to(message, f"💸 How much to withdraw?\nBalance: ${user[2]:.2f}\n\nSend amount only. Example: 2.5")
 
-@bot.message_handler(func=lambda m: m.text == '💳 Deposit')
-def deposit(message):
-    cursor.execute("UPDATE users SET state='d_amount' WHERE user_id=?", (message.chat.id,))
-    conn.commit()
-    bot.reply_to(message, "💳 How much to deposit?\n\nSend amount. Then send money to bKash: 01612345678 and provide TrxID")
+    if user.id in banned_users:
+        await update.message.reply_text("🚫 You are banned from this bot")
+        return
 
-@bot.message_handler(func=lambda m: True)
-def handle_text(message):
-    user_id = message.chat.id
-    user = get_user(user_id)
-    if not user: return
-    state = user[10]
+    is_new = user.id not in all_users
+    all_users.add(user.id)
+    save_json(USERS_FILE, {"users": list(all_users)})
+    stats[str(user.id)] = {
+        "joined": datetime.now().strftime("%Y-%m-%d"),
+        "name": user.full_name,
+        "username": user.username or "None",
+        "active": True
+    }
+    save_json(STATS_FILE, stats)
 
-    if state == 'w_amount':
+    if is_new:
+        username = f"@{user.username}" if user.username else "No username"
+        profile_link = f"<a href='tg://user?id={user.id}'>View Profile</a>"
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"🆕 <b>New User Joined!</b>\n\n"
+                 f"👤 Name: {user.full_name}\n"
+                 f"Username: {username}\n"
+                 f"Chat ID: <code>{user.id}</code>\n"
+                 f"{profile_link}\n\n"
+                 f"📊 Total Users: {len(all_users)}",
+            parse_mode='HTML'
+        )
+
+    await update.message.reply_text(
+        "👋 Welcome to JA CAPTCHA BOT\n\n"
+        "📝 Describe your problem in detail\n"
+        "⏰ You will get a reply within 24 hours\n\n"
+        "⚡️ For faster assistance, please explain clearly\n\n"
+        "❓ Do you need any help?",
+        parse_mode='HTML'
+    )
+
+# ========== E. PANEL - NO BUTTON ==========
+async def panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.chat_id!= ADMIN_ID:
+        return
+
+    total = len(all_users)
+    banned = len(banned_users)
+    blocked = len(blocked_users)
+    active = sum(1 for s in stats.values() if s.get("active", True))
+
+    await update.message.reply_text(
+        f"👑 <b>Admin Panel</b>\n\n"
+        f"👥 Total Users: {total}\n"
+        f"✅ Active: {active}\n"
+        f"🚫 Banned by Admin: {banned}\n"
+        f"🚷 Blocked Bot: {blocked}\n\n"
+        f"<b>Commands - Click to Copy:</b>\n"
+        f"<code>/stats</code> - Full Statistics\n"
+        f"<code>/users</code> - All Users List\n"
+        f"<code>/banned</code> - Banned Users\n"
+        f"<code>/blocked</code> - Blocked Bot Users\n"
+        f"<code>/ban 12345</code> - Ban user\n"
+        f"<code>/unban 12345</code> - Unban user\n"
+        f"<code>/broadcast msg</code> - Send to all\n\n"
+        f"💡 Reply to user message to send reply\n"
+        f"💡 Edit your message to <code>/del</code> to delete from user\n"
+        f"💡 Broadcast photo/video/doc + <code>/del</code> = delete from all users",
+        parse_mode='HTML'
+    )
+
+# ========== F. STATS ==========
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.chat_id!= ADMIN_ID:
+        return
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    today_count = sum(1 for d in stats.values() if d.get("joined") == today)
+
+    await update.message.reply_text(
+        f"📊 <b>Full Statistics</b>\n\n"
+        f"👥 Total Users: {len(all_users)}\n"
+        f"✅ Active: {sum(1 for s in stats.values() if s.get('active', True))}\n"
+        f"🚫 Banned by Admin: {len(banned_users)}\n"
+        f"🚷 Blocked Bot: {len(blocked_users)}\n"
+        f"📅 Today Joined: {today_count}",
+        parse_mode='HTML'
+    )
+
+# ========== G. USERS ==========
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.chat_id!= ADMIN_ID:
+        return
+
+    text = f"👥 <b>Users: {len(all_users)}</b>\n\n"
+    for idx, uid in enumerate(list(all_users)[:30], 1):
+        name = stats.get(str(uid), {}).get("name", "Unknown")
+        username = stats.get(str(uid), {}).get("username", "None")
+        status = "🚫" if uid in banned_users else "👤"
+        if uid in blocked_users: status += "🚷"
+        text += f"{idx}. {name} {status}\n@{username}\n<code>{uid}</code>\n\n"
+
+    await update.message.reply_text(text, parse_mode='HTML')
+
+# ========== H. BANNED ==========
+async def banned_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.chat_id!= ADMIN_ID:
+        return
+
+    text = f"🚫 <b>Banned: {len(banned_users)}</b>\n\n"
+    for idx, uid in enumerate(list(banned_users)[:30], 1):
+        name = stats.get(str(uid), {}).get("name", "Unknown")
+        text += f"{idx}. {name}\n<code>{uid}</code>\n\n"
+    if not banned_users:
+        text += "No banned users"
+
+    await update.message.reply_text(text, parse_mode='HTML')
+
+# ========== I. BLOCKED ==========
+async def blocked_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.chat_id!= ADMIN_ID:
+        return
+
+    text = f"🚷 <b>Blocked Bot: {len(blocked_users)}</b>\n\n"
+    for idx, uid in enumerate(list(blocked_users)[:30], 1):
+        name = stats.get(str(uid), {}).get("name", "Unknown")
+        text += f"{idx}. {name}\n<code>{uid}</code>\n\n"
+    if not blocked_users:
+        text += "No blocked users"
+
+    await update.message.reply_text(text, parse_mode='HTML')
+
+# ========== J. BAN/UNBAN ==========
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.chat_id!= ADMIN_ID:
+        return
+    user_id = None
+    if update.message.reply_to_message:
+        user_id = update.message.reply_to_message.from_user.id
+    elif context.args and context.args[0].isdigit():
+        user_id = int(context.args[0])
+
+    if user_id:
+        banned_users.add(user_id)
+        save_json(BANNED_FILE, {"banned": list(banned_users)})
+        await update.message.reply_text(f"🚫 User <code>{user_id}</code> banned", parse_mode='HTML')
         try:
-            amount = float(message.text)
-            if amount < MIN_WITHDRAW or amount > user[2]:
-                bot.reply_to(message, "❌ Invalid amount")
+            await context.bot.send_message(chat_id=user_id, text="🚫 You have been banned by admin")
+        except:
+            pass
+
+async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.chat_id!= ADMIN_ID:
+        return
+    user_id = None
+    if update.message.reply_to_message:
+        user_id = update.message.reply_to_message.from_user.id
+    elif context.args and context.args[0].isdigit():
+        user_id = int(context.args[0])
+
+    if user_id and user_id in banned_users:
+        banned_users.remove(user_id)
+        save_json(BANNED_FILE, {"banned": list(banned_users)})
+        await update.message.reply_text(f"✅ User <code>{user_id}</code> unbanned", parse_mode='HTML')
+        try:
+            await context.bot.send_message(chat_id=user_id, text="✅ You have been unbanned by admin")
+        except:
+            pass
+
+# ========== K. BROADCAST ==========
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.chat_id!= ADMIN_ID:
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: <code>/broadcast Your message</code>", parse_mode='HTML')
+        return
+
+    msg = " ".join(context.args)
+    success = 0
+    failed = 0
+
+    for uid in all_users:
+        if uid in banned_users or uid in blocked_users:
+            continue
+        try:
+            await context.bot.send_message(chat_id=uid, text=f"📢 <b>Announcement</b>\n\n{msg}", parse_mode='HTML')
+            success += 1
+        except:
+            failed += 1
+            blocked_users.add(uid)
+
+    save_json(BLOCKED_FILE, {"blocked": list(blocked_users)})
+    await update.message.reply_text(f"✅ Broadcast Done\n\nSuccess: {success}\nFailed: {failed}")
+
+# ========== L. MESSAGE HANDLER - BROADCAST DELETE TRACKING ==========
+async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global messages_map, broadcast_map
+    user = update.message.from_user
+
+    # Admin Reply/Broadcast
+    if user.id == ADMIN_ID:
+        # Reply to User
+        if update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id:
+            admin_msg_id = str(update.message.reply_to_message.message_id)
+            if admin_msg_id in messages_map:
+                target_user_id = messages_map[admin_msg_id]["user_id"]
+                try:
+                    if update.message.text:
+                        sent = await context.bot.send_message(chat_id=target_user_id, text=update.message.text)
+                    elif update.message.photo:
+                        sent = await context.bot.send_photo(chat_id=target_user_id, photo=update.message.photo[-1].file_id, caption=update.message.caption)
+                    elif update.message.video:
+                        sent = await context.bot.send_video(chat_id=target_user_id, video=update.message.video.file_id, caption=update.message.caption)
+                    elif update.message.document:
+                        sent = await context.bot.send_document(chat_id=target_user_id, document=update.message.document.file_id, caption=update.message.caption)
+                    elif update.message.voice:
+                        sent = await context.bot.send_voice(chat_id=target_user_id, voice=update.message.voice.file_id, caption=update.message.caption)
+                    else:
+                        sent = await context.bot.send_message(chat_id=target_user_id, text="Message")
+
+                    messages_map[str(update.message.message_id)] = {"user_id": target_user_id, "user_msg_id": sent.message_id}
+                    save_json(MESSAGES_FILE, messages_map)
+
+                    await update.message.reply_text(f"✅ Sent to user <code>{target_user_id}</code>", parse_mode='HTML')
+                except Exception as e:
+                    await update.message.reply_text(f"❌ Failed: {str(e)}")
                 return
-            cursor.execute("UPDATE users SET state=? WHERE user_id=?", (f'w_method_{amount}', user_id))
-            conn.commit()
-            markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-            markup.row('bKash', 'Nagad')
-            bot.reply_to(message, "📱 Select Method:", reply_markup=markup)
-        except: bot.reply_to(message, "❌ Numbers only")
-    elif state and state.startswith('w_method_'):
-        amount = float(state.split('_')[2])
-        cursor.execute("UPDATE users SET state=? WHERE user_id=?", (f'w_acc_{amount}_{message.text}', user_id))
-        conn.commit()
-        bot.reply_to(message, f"🔢 Send your {message.text} number:", reply_markup=types.ReplyKeyboardRemove())
-    elif state and state.startswith('w_acc_'):
-        parts = state.split('_')
-        amount, method, account = float(parts[2]), parts[3], message.text
-        cursor.execute("UPDATE users SET balance = balance -?, state='' WHERE user_id=?", (amount, user_id))
-        cursor.execute("INSERT INTO withdraws (user_id, amount, method, account, date) VALUES (?,?,?,?,?)",
-                      (user_id, amount, method, account, datetime.now().strftime('%Y-%m-%d %H:%M')))
-        conn.commit()
-        bot.reply_to(message, f"✅ Withdraw Submitted!\n💵 ${amount}\n📱 {method}: {account}", reply_markup=main_menu())
-        try: bot.send_message(ADMIN_ID, f"🔔 New Withdraw\nUser: {user_id}\nAmount: ${amount}\n{method}: {account}")
-        except: pass
-    elif state == 'd_amount':
-        try:
-            amount = float(message.text)
-            cursor.execute("UPDATE users SET state=? WHERE user_id=?", (f'd_trx_{amount}', user_id))
-            conn.commit()
-            bot.reply_to(message, f"Sent ${amount}?\nSend TrxID now")
-        except: bot.reply_to(message, "❌ Numbers only")
-    elif state and state.startswith('d_trx_'):
-        amount = float(state.split('_')[2])
-        cursor.execute("UPDATE users SET state='' WHERE user_id=?", (user_id,))
-        conn.commit()
-        bot.reply_to(message, "✅ Deposit Submitted! Admin will approve within 24h", reply_markup=main_menu())
-        try: bot.send_message(ADMIN_ID, f"🔔 New Deposit\nUser: {user_id}\nAmount: ${amount}\nTrxID: {message.text}")
-        except: pass
 
-# Flask webhook for Render
-@app.route('/' + BOT_TOKEN, methods=['POST'])
-def webhook():
-    json_str = request.get_data().decode('UTF-8')
-    update = telebot.types.Update.de_json(json_str)
-    bot.process_new_updates([update])
-    return '!', 200
+        # Broadcast - TRACK ALL MESSAGE IDS FOR DELETE
+        if not update.message.reply_to_message:
+            broadcast_data = {}
+            success = 0
+            for uid in all_users:
+                if uid in banned_users or uid in blocked_users:
+                    continue
+                try:
+                    if update.message.text:
+                        sent = await context.bot.send_message(chat_id=uid, text=f"📢 <b>Announcement</b>\n\n{update.message.text}", parse_mode='HTML')
+                    elif update.message.photo:
+                        sent = await context.bot.send_photo(chat_id=uid, photo=update.message.photo[-1].file_id, caption=update.message.caption)
+                    elif update.message.video:
+                        sent = await context.bot.send_video(chat_id=uid, video=update.message.video.file_id, caption=update.message.caption)
+                    elif update.message.document:
+                        sent = await context.bot.send_document(chat_id=uid, document=update.message.document.file_id, caption=update.message.caption)
+                    broadcast_data[str(uid)] = sent.message_id
+                    success += 1
+                except:
+                    blocked_users.add(uid)
+            save_json(BLOCKED_FILE, {"blocked": list(blocked_users)})
 
-@app.route('/')
-def index():
-    return 'Bot is Running 24/7!', 200
+            # Save broadcast mapping for delete
+            broadcast_map[str(update.message.message_id)] = broadcast_data
+            save_json(BROADCAST_FILE, broadcast_map)
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get('PORT', 10000)))
+            await update.message.reply_text(f"✅ Broadcast sent to {success} users")
+            return
+
+    if user.id in banned_users:
+        return
+
+    # User message to admin
+    username = f"@{user.username}" if user.username else "No username"
+    user_info = f"👤 From: {user.full_name}\nUsername: {username}\nID: <code>{user.id}</code>\n\n"
+
+    try:
+        sent_msg = None
+        if update.message.text:
+            sent_msg = await context.bot.send_message(chat_id=ADMIN_ID, text=user_info + f"💬 {update.message.text}", parse_mode='HTML')
+        elif update.message.photo:
+            sent_msg = await context.bot.send_photo(chat_id=ADMIN_ID, photo=update.message.photo[-1].file_id, caption=user_info + f"📷 Photo\n{update.message.caption or ''}", parse_mode='HTML')
+        elif update.message.video:
+            sent_msg = await context.bot.send_video(chat_id=ADMIN_ID, video=update.message.video.file_id, caption=user_info + f"🎥 Video\n{update.message.caption or ''}", parse_mode='HTML')
+        elif update.message.document:
+            sent_msg = await context.bot.send_document(chat_id=ADMIN_ID, document=update.message.document.file_id, caption=user_info + f"📄 {update.message.document.file_name}\n{update.message.caption or ''}", parse_mode='HTML')
+        elif update.message.voice:
+            sent_msg = await context.bot.send_voice(chat_id=ADMIN_ID, voice=update.message.voice.file_id, caption=user_info + f"🎤 Voice", parse_mode='HTML')
+        else:
+            sent_msg = await context.bot.send_message(chat_id=ADMIN_ID, text=user_info + f"💬 Message", parse_mode='HTML')
+
+        if sent_msg:
+            messages_map[str(sent_msg.message_id)] = {"user_id": user.id, "user_msg_id": update.message.message_id}
+            save_json(MESSAGES_FILE, messages_map)
+
+        await update.message.reply_text("✅ Sent to admin")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+# ========== M. EDIT HANDLER - /del DELETE FROM ALL ==========
+async def handle_edited_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.edited_message.from_user
+
+    # User edit করলে admin এ নোটিফিকেশন
+    if user.id!= ADMIN_ID:
+        username = f"@{user.username}" if user.username else "No username"
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"✏️ <b>User Edited Message</b>\n\n"
+                 f"👤 From: {user.full_name}\n"
+                 f"Username: {username}\n"
+                 f"ID: <code>{user.id}</code>\n\n"
+                 f"💬 New Message: {update.edited_message.text or '[Media/File]'}",
+            parse_mode='HTML'
+        )
+
+    # Admin edit করে /del দিলে user এর কাছ থেকে delete হবে
+    if user.id == ADMIN_ID:
+        if update.edited_message.text and update.edited_message.text.strip() == "/del":
+            admin_msg_id = str(update.edited_message.message_id)
+
+            # Single user message delete
+            if admin_msg_id in messages_map:
+                data = messages_map[admin_msg_id]
+                try:
+                    await context.bot.delete_message(chat_id=data["user_id"], message_id=data["user_msg_id"])
+                    await context.bot.delete_message(chat_id=ADMIN_ID, message_id=update.edited_message.message_id)
+                    await context.bot.send_message(chat_id=ADMIN_ID, text="✅ Deleted from user's chat")
+                except Exception as e:
+                    await context.bot.send_message(chat_id=ADMIN_ID, text=f"❌ Could not delete: {str(e)}")
+                return
+
+            # Broadcast message delete from all users
+            if admin_msg_id in broadcast_map:
+                deleted = 0
+                failed = 0
+                for user_id, msg_id in broadcast_map[admin_msg_id].items():
+                    try:
+                        await context.bot.delete_message(chat_id=int(user_id), message_id=msg_id)
+                        deleted += 1
+                    except:
+                        failed += 1
+
+                try:
+                    await context.bot.delete_message(chat_id=ADMIN_ID, message_id=update.edited_message.message_id)
+                except:
+                    pass
+
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=f"✅ Deleted from all users\n\nDeleted: {deleted}\nFailed: {failed}"
+                )
+                return
+
+        # Normal edit করলে user এর কাছে update হবে
+        admin_msg_id = str(update.edited_message.message_id)
+        if admin_msg_id in messages_map:
+            data = messages_map[admin_msg_id]
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=data["user_id"],
+                    message_id=data["user_msg_id"],
+                    text=update.edited_message.text
+                )
+            except:
+                pass
+
+# ========== N. RUN ==========
+app = Application.builder().token(TOKEN).build()
+app.post_init = setup_commands
+
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("panel", panel_command))
+app.add_handler(CommandHandler("stats", stats_command))
+app.add_handler(CommandHandler("users", users_command))
+app.add_handler(CommandHandler("banned", banned_command))
+app.add_handler(CommandHandler("blocked", blocked_command))
+app.add_handler(CommandHandler("ban", ban_command))
+app.add_handler(CommandHandler("unban", unban_command))
+app.add_handler(CommandHandler("broadcast", broadcast_command))
+app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_user_message))
+app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE, handle_edited_message))
+
+print("KolotiBablo Live Chat Official Bot Running...")
+print(f"[START] Users: {len(all_users)} | Banned: {len(banned_users)} | Blocked: {len(blocked_users)}")
+app.run_polling()
